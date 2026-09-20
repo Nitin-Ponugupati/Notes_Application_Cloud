@@ -1,0 +1,220 @@
+trigger:
+  branches:
+    include:
+      - main
+
+variables:
+  - group: notes-app-secrets
+  - name: azureServiceConnection
+    value: 'azure-notes-app-connection'
+  - name: buildConfiguration
+    value: 'Release'
+  - name: appProjectDirectory
+    value: '$(System.DefaultWorkingDirectory)/Notes_Application'
+  - name: terraformDirectory
+    value: '$(System.DefaultWorkingDirectory)/terraform'
+  - name: appServiceName
+    value: 'app-notes-application'
+  - name: resourceGroupName
+    value: 'rg-notes-app'
+  - name: sqlServerName
+    value: 'sql-notes-app-cus'
+  - name: sqlServerFqdn
+    value: 'sql-notes-app-cus.database.windows.net'
+  - name: sqlDatabaseName
+    value: 'ProductDb'
+  - name: sqlAdminLogin
+    value: 'sqladmin'
+
+stages:
+
+  # =========================================================
+  # BUILD PIPELINE
+  # =========================================================
+  - stage: Build
+    displayName: 'Build Pipeline'
+    jobs:
+      - job: BuildAndPublish
+        displayName: 'Build, Test & Publish .NET App'
+        pool:
+          vmImage: 'ubuntu-latest'
+        steps:
+          - task: UseDotNet@2
+            displayName: 'Install .NET 10 SDK'
+            inputs:
+              packageType: 'sdk'
+              version: '10.0.x'
+
+          - script: |
+              dotnet restore "$(appProjectDirectory)/Notes_Application.csproj"
+            displayName: 'Restore NuGet Packages'
+
+          - script: |
+              dotnet build "$(appProjectDirectory)/Notes_Application.csproj" --configuration $(buildConfiguration) --no-restore
+            displayName: 'Build Project'
+
+          - script: |
+              dotnet publish "$(appProjectDirectory)/Notes_Application.csproj" \
+                --configuration $(buildConfiguration) \
+                --no-build \
+                --output "$(Build.ArtifactStagingDirectory)/publish"
+            displayName: 'Publish Project'
+
+          - task: ArchiveFiles@2
+            displayName: 'Archive Published App'
+            inputs:
+              rootFolderOrFile: '$(Build.ArtifactStagingDirectory)/publish'
+              includeRootFolder: false
+              archiveType: 'zip'
+              archiveFile: '$(Build.ArtifactStagingDirectory)/app-$(Build.BuildId).zip'
+              replaceExistingArchive: true
+
+          - publish: '$(Build.ArtifactStagingDirectory)/app-$(Build.BuildId).zip'
+            artifact: 'app-drop'
+            displayName: 'Publish App Artifact'
+
+          - publish: '$(terraformDirectory)'
+            artifact: 'terraform-drop'
+            displayName: 'Publish Terraform Artifact'
+
+  # =========================================================
+  # RELEASE PIPELINE - Infrastructure
+  # =========================================================
+  - stage: ReleaseInfrastructure
+    displayName: 'Release: Infrastructure (Terraform)'
+    dependsOn: Build
+    jobs:
+      - deployment: TerraformApply
+        displayName: 'Provision/Update Azure Infrastructure'
+        pool:
+          vmImage: 'ubuntu-latest'
+        environment: 'production-infra'
+        strategy:
+          runOnce:
+            deploy:
+              steps:
+                - task: TerraformInstaller@1
+                  displayName: 'Install Terraform'
+                  inputs:
+                    terraformVersion: '1.9.0'
+
+                - task: TerraformTaskV4@4
+                  displayName: 'Terraform Init'
+                  inputs:
+                    provider: 'azurerm'
+                    command: 'init'
+                    workingDirectory: '$(Pipeline.Workspace)/terraform-drop'
+                    backendServiceArm: '$(azureServiceConnection)'
+                    backendAzureRmResourceGroupName: 'rg-terraform-state'
+                    backendAzureRmStorageAccountName: 'sttfstatenotesapp'
+                    backendAzureRmContainerName: 'tfstate'
+                    backendAzureRmKey: 'notes-application.tfstate'
+
+                - task: TerraformTaskV4@4
+                  displayName: 'Terraform Plan'
+                  inputs:
+                    provider: 'azurerm'
+                    command: 'plan'
+                    workingDirectory: '$(Pipeline.Workspace)/terraform-drop'
+                    environmentServiceNameAzureRM: '$(azureServiceConnection)'
+                    commandOptions: '-var="sql_admin_password=$(sqlAdminPassword)"'
+
+                - task: TerraformTaskV4@4
+                  displayName: 'Terraform Apply'
+                  inputs:
+                    provider: 'azurerm'
+                    command: 'apply'
+                    workingDirectory: '$(Pipeline.Workspace)/terraform-drop'
+                    environmentServiceNameAzureRM: '$(azureServiceConnection)'
+                    commandOptions: '-var="sql_admin_password=$(sqlAdminPassword)" -auto-approve'
+
+  # =========================================================
+  # RELEASE PIPELINE - App Deployment
+  # =========================================================
+  - stage: ReleaseApp
+    displayName: 'Release: Deploy App to App Service'
+    dependsOn: ReleaseInfrastructure
+    jobs:
+      - deployment: DeployWebApp
+        displayName: 'Deploy to Azure App Service'
+        pool:
+          vmImage: 'ubuntu-latest'
+        environment: 'production'
+        strategy:
+          runOnce:
+            deploy:
+              steps:
+                - task: AzureWebApp@1
+                  displayName: 'Deploy App Package'
+                  inputs:
+                    azureSubscription: '$(azureServiceConnection)'
+                    appType: 'webAppLinux'
+                    appName: '$(appServiceName)'
+                    package: '$(Pipeline.Workspace)/app-drop/app-$(Build.BuildId).zip'
+
+  # =========================================================
+  # RELEASE PIPELINE - Database Migration
+  # =========================================================
+  - stage: ReleaseMigrateDatabase
+    displayName: 'Release: Apply EF Core Migrations'
+    dependsOn: ReleaseApp
+    jobs:
+      - job: RunMigrations
+        displayName: 'Run dotnet ef database update'
+        pool:
+          vmImage: 'ubuntu-latest'
+        steps:
+          - task: UseDotNet@2
+            displayName: 'Install .NET 10 SDK'
+            inputs:
+              packageType: 'sdk'
+              version: '10.0.x'
+
+          - script: dotnet tool install --global dotnet-ef
+            displayName: 'Install dotnet-ef tool'
+
+          - checkout: self
+            displayName: 'Checkout source for migration project'
+
+          - task: AzureCLI@2
+            displayName: 'Temporarily Allow Pipeline Agent IP on SQL Firewall'
+            inputs:
+              azureSubscription: '$(azureServiceConnection)'
+              scriptType: 'bash'
+              scriptLocation: 'inlineScript'
+              inlineScript: |
+                AGENT_IP=$(curl -s https://api.ipify.org)
+                az sql server firewall-rule create \
+                  --resource-group $(resourceGroupName) \
+                  --server $(sqlServerName) \
+                  --name AllowPipelineAgent \
+                  --start-ip-address $AGENT_IP \
+                  --end-ip-address $AGENT_IP
+                az sql server update \
+                  --name $(sqlServerName) \
+                  --resource-group $(resourceGroupName) \
+                  --set publicNetworkAccess=Enabled
+
+          - script: |
+              export PATH="$PATH:$HOME/.dotnet/tools"
+              dotnet ef database update \
+                --project "$(appProjectDirectory)/Notes_Application.csproj" \
+                --connection "Server=tcp:$(sqlServerFqdn),1433;Database=$(sqlDatabaseName);User ID=$(sqlAdminLogin);Password=$(sqlAdminPassword);Encrypt=true;"
+            displayName: 'Apply EF Core Migrations'
+
+          - task: AzureCLI@2
+            displayName: 'Revert SQL Firewall to Private-Only'
+            condition: always()
+            inputs:
+              azureSubscription: '$(azureServiceConnection)'
+              scriptType: 'bash'
+              scriptLocation: 'inlineScript'
+              inlineScript: |
+                az sql server firewall-rule delete \
+                  --resource-group $(resourceGroupName) \
+                  --server $(sqlServerName) \
+                  --name AllowPipelineAgent || true
+                az sql server update \
+                  --name $(sqlServerName) \
+                  --resource-group $(resourceGroupName) \
+                  --set publicNetworkAccess=Disabled

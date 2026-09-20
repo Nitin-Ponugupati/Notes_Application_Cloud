@@ -1,0 +1,10 @@
+# Copy this file to terraform.tfvars and fill in real values.
+# terraform.tfvars is gitignored — never commit real secrets.
+
+resource_group_name = "rg-notes-app"
+location            = "eastus"
+app_name            = "app-notes-application"
+sql_server_name     = "sql-notes-app"
+sql_database_name   = "ProductDb"
+sql_admin_login     = "sqladmin"
+sql_admin_password  = "REPLACE_WITH_A_STRONG_PASSWORD"

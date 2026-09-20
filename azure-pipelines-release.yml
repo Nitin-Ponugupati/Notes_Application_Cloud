@@ -1,18 +1,24 @@
-trigger:
-  branches:
-    include:
-      - master
+# This pipeline does NOT trigger automatically on push.
+# It is triggered manually, or automatically after the Build pipeline succeeds
+# (configured via 'resources.pipelines' below).
+trigger: none
+
+resources:
+  pipelines:
+    - pipeline: buildPipeline        # local alias used to reference artifacts below
+      source: 'Notes_Application-Build'   # must exactly match the Build pipeline's name in Azure DevOps
+      trigger:
+        branches:
+          include:
+            - master
+            - deploy-application
 
 variables:
   - group: notes-app-secrets
   - name: azureServiceConnection
     value: 'azure-notes-app-connection'
-  - name: buildConfiguration
-    value: 'Release'
   - name: appProjectDirectory
     value: '$(System.DefaultWorkingDirectory)/Notes_Application'
-  - name: terraformDirectory
-    value: '$(System.DefaultWorkingDirectory)/terraform'
   - name: appServiceName
     value: 'app-notes-application'
   - name: resourceGroupName
@@ -29,60 +35,10 @@ variables:
 stages:
 
   # =========================================================
-  # BUILD PIPELINE
-  # =========================================================
-  - stage: Build
-    displayName: 'Build Pipeline'
-    jobs:
-      - job: BuildAndPublish
-        displayName: 'Build, Test & Publish .NET App'
-        pool:
-          vmImage: 'ubuntu-latest'
-        steps:
-          - task: UseDotNet@2
-            displayName: 'Install .NET 10 SDK'
-            inputs:
-              packageType: 'sdk'
-              version: '10.0.x'
-
-          - script: |
-              dotnet restore "$(appProjectDirectory)/Notes_Application.csproj"
-            displayName: 'Restore NuGet Packages'
-
-          - script: |
-              dotnet build "$(appProjectDirectory)/Notes_Application.csproj" --configuration $(buildConfiguration) --no-restore
-            displayName: 'Build Project'
-
-          - script: |
-              dotnet publish "$(appProjectDirectory)/Notes_Application.csproj" \
-                --configuration $(buildConfiguration) \
-                --no-build \
-                --output "$(Build.ArtifactStagingDirectory)/publish"
-            displayName: 'Publish Project'
-
-          - task: ArchiveFiles@2
-            displayName: 'Archive Published App'
-            inputs:
-              rootFolderOrFile: '$(Build.ArtifactStagingDirectory)/publish'
-              includeRootFolder: false
-              archiveType: 'zip'
-              archiveFile: '$(Build.ArtifactStagingDirectory)/app-$(Build.BuildId).zip'
-              replaceExistingArchive: true
-
-          - publish: '$(Build.ArtifactStagingDirectory)/app-$(Build.BuildId).zip'
-            artifact: 'app-drop'
-            displayName: 'Publish App Artifact'
-
-          - publish: '$(terraformDirectory)'
-            artifact: 'terraform-drop'
-            displayName: 'Publish Terraform Artifact'
-
-  # =========================================================
-  # RELEASE PIPELINE - Infrastructure
+  # RELEASE STAGE 1: Infrastructure (Terraform)
   # =========================================================
   - stage: ReleaseInfrastructure
     displayName: 'Release: Infrastructure (Terraform)'
-    dependsOn: Build
     jobs:
       - deployment: TerraformApply
         displayName: 'Provision/Update Azure Infrastructure'
@@ -93,6 +49,10 @@ stages:
           runOnce:
             deploy:
               steps:
+                - download: buildPipeline
+                  artifact: 'terraform-drop'
+                  displayName: 'Download Terraform Artifact from Build'
+
                 - task: TerraformInstaller@1
                   displayName: 'Install Terraform'
                   inputs:
@@ -103,7 +63,7 @@ stages:
                   inputs:
                     provider: 'azurerm'
                     command: 'init'
-                    workingDirectory: '$(Pipeline.Workspace)/terraform-drop'
+                    workingDirectory: '$(Pipeline.Workspace)/buildPipeline/terraform-drop'
                     backendServiceArm: '$(azureServiceConnection)'
                     backendAzureRmResourceGroupName: 'rg-terraform-state'
                     backendAzureRmStorageAccountName: 'sttfstatenotesapp'
@@ -115,7 +75,7 @@ stages:
                   inputs:
                     provider: 'azurerm'
                     command: 'plan'
-                    workingDirectory: '$(Pipeline.Workspace)/terraform-drop'
+                    workingDirectory: '$(Pipeline.Workspace)/buildPipeline/terraform-drop'
                     environmentServiceNameAzureRM: '$(azureServiceConnection)'
                     commandOptions: '-var="sql_admin_password=$(sqlAdminPassword)"'
 
@@ -124,12 +84,12 @@ stages:
                   inputs:
                     provider: 'azurerm'
                     command: 'apply'
-                    workingDirectory: '$(Pipeline.Workspace)/terraform-drop'
+                    workingDirectory: '$(Pipeline.Workspace)/buildPipeline/terraform-drop'
                     environmentServiceNameAzureRM: '$(azureServiceConnection)'
                     commandOptions: '-var="sql_admin_password=$(sqlAdminPassword)" -auto-approve'
 
   # =========================================================
-  # RELEASE PIPELINE - App Deployment
+  # RELEASE STAGE 2: Deploy App to App Service
   # =========================================================
   - stage: ReleaseApp
     displayName: 'Release: Deploy App to App Service'
@@ -144,16 +104,20 @@ stages:
           runOnce:
             deploy:
               steps:
+                - download: buildPipeline
+                  artifact: 'app-drop'
+                  displayName: 'Download App Artifact from Build'
+
                 - task: AzureWebApp@1
                   displayName: 'Deploy App Package'
                   inputs:
                     azureSubscription: '$(azureServiceConnection)'
                     appType: 'webAppLinux'
                     appName: '$(appServiceName)'
-                    package: '$(Pipeline.Workspace)/app-drop/app-$(Build.BuildId).zip'
+                    package: '$(Pipeline.Workspace)/buildPipeline/app-drop/*.zip'
 
   # =========================================================
-  # RELEASE PIPELINE - Database Migration
+  # RELEASE STAGE 3: Apply EF Core Migrations
   # =========================================================
   - stage: ReleaseMigrateDatabase
     displayName: 'Release: Apply EF Core Migrations'
@@ -164,6 +128,9 @@ stages:
         pool:
           vmImage: 'ubuntu-latest'
         steps:
+          - checkout: self
+            displayName: 'Checkout source for migration project'
+
           - task: UseDotNet@2
             displayName: 'Install .NET 10 SDK'
             inputs:
@@ -172,9 +139,6 @@ stages:
 
           - script: dotnet tool install --global dotnet-ef
             displayName: 'Install dotnet-ef tool'
-
-          - checkout: self
-            displayName: 'Checkout source for migration project'
 
           - task: AzureCLI@2
             displayName: 'Temporarily Allow Pipeline Agent IP on SQL Firewall'

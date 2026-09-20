@@ -1,0 +1,60 @@
+trigger:
+  branches:
+    include:
+      - master
+      - deploy-application
+
+variables:
+  - name: buildConfiguration
+    value: 'Release'
+  - name: appProjectDirectory
+    value: '$(System.DefaultWorkingDirectory)/Notes_Application'
+  - name: terraformDirectory
+    value: '$(System.DefaultWorkingDirectory)/terraform'
+
+stages:
+  - stage: Build
+    displayName: 'Build Pipeline'
+    jobs:
+      - job: BuildAndPublish
+        displayName: 'Build, Test & Publish .NET App'
+        pool:
+          vmImage: 'ubuntu-latest'
+        steps:
+          - task: UseDotNet@2
+            displayName: 'Install .NET 10 SDK'
+            inputs:
+              packageType: 'sdk'
+              version: '10.0.x'
+
+          - script: |
+              dotnet restore "$(appProjectDirectory)/Notes_Application.csproj"
+            displayName: 'Restore NuGet Packages'
+
+          - script: |
+              dotnet build "$(appProjectDirectory)/Notes_Application.csproj" --configuration $(buildConfiguration) --no-restore
+            displayName: 'Build Project'
+
+          - script: |
+              dotnet publish "$(appProjectDirectory)/Notes_Application.csproj" \
+                --configuration $(buildConfiguration) \
+                --no-build \
+                --output "$(Build.ArtifactStagingDirectory)/publish"
+            displayName: 'Publish Project'
+
+          - task: ArchiveFiles@2
+            displayName: 'Archive Published App'
+            inputs:
+              rootFolderOrFile: '$(Build.ArtifactStagingDirectory)/publish'
+              includeRootFolder: false
+              archiveType: 'zip'
+              archiveFile: '$(Build.ArtifactStagingDirectory)/app-$(Build.BuildId).zip'
+              replaceExistingArchive: true
+
+          - publish: '$(Build.ArtifactStagingDirectory)/app-$(Build.BuildId).zip'
+            artifact: 'app-drop'
+            displayName: 'Publish App Artifact'
+
+          - publish: '$(terraformDirectory)'
+            artifact: 'terraform-drop'
+            displayName: 'Publish Terraform Artifact'

@@ -24,9 +24,9 @@ variable "sql_server_name" {
   default = "sql-notes-app"
 }
 
-variable "sql_database_name" {
+variable "sql_prod_database_name" {
   type    = string
-  default = "ProductDb"
+  default = "notes-production"
 }
 
 variable "sql_admin_login" {
@@ -37,4 +37,14 @@ variable "sql_admin_login" {
 variable "sql_admin_password" {
   type      = string
   sensitive = true
+}
+
+variable "sql_staging_database_name" {
+  type    = string
+  default = "notes-staging"
+}
+
+variable "staging_slot_name" {
+  type    = string
+  default = "staging"
 }

@@ -15,6 +15,11 @@ namespace Notes_Application.Controllers
             _notesService = notesService;
         }
 
+        [HttpGet(Name ="Health")]
+        public ActionResult<string> Health()
+        {
+            return Ok("Notes API is running.");
+        }
         [HttpGet(Name = "GetNotes")]
         public async Task<ActionResult<List<Notes>>> Get()
         {

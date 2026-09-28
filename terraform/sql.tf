@@ -10,8 +10,14 @@ resource "azurerm_mssql_server" "sql_server" {
   public_network_access_enabled = false
 }
 
-resource "azurerm_mssql_database" "sql_db" {
-  name      = var.sql_database_name
+resource "azurerm_mssql_database" "notes_prod_db" {
+  name      = var.sql_prod_database_name
+  server_id = azurerm_mssql_server.sql_server.id
+  sku_name  = "Basic"
+}
+
+resource "azurerm_mssql_database" "notes_staging_db" {
+  name      = var.sql_staging_database_name
   server_id = azurerm_mssql_server.sql_server.id
   sku_name  = "Basic"
 }
